@@ -6,78 +6,94 @@ import { TRPCError } from '@trpc/server';
 import { eq } from 'drizzle-orm';
 
 import { AuthService } from './auth.service';
+import { createUserPreview, upsertUserPreview } from '../../mock/users-store';
+
+const isPreview = process.env.NEXT_PUBLIC_PREVIEW_MODE === '1';
 
 export class UserService {
-	static async createUser({
-		phone,
-		password,
-	}: {
-		phone: string;
-		password: string;
-	}) {
-		const existing = await db
-			.select()
-			.from(tableUsers)
-			.where(eq(tableUsers.phone, phone));
+  static async createUser({ phone, password }: { phone: string; password: string }) {
+    if (isPreview) {
+      const newUser = createUserPreview(phone, password);
+      const tokens = AuthService.generateTokens(newUser.userId, newUser.phone);
 
-		console.log(env.REFRESH_TOKEN_EXPIRATION);
+      // preview: “сохраняем” refresh в памяти
+      const userWithTokens = await AuthService.updateTokens(newUser.userId, tokens.refreshToken);
 
-		if (existing.length)
-			throw new TRPCError({
-				code: 'CONFLICT',
-				message: 'Пользователь с таким номером телефона уже существует',
-			});
+      return {
+        ...userWithTokens,
+        accessToken: tokens.accessToken,
+      };
+    }
 
-		const result = await db
-			.insert(tableUsers)
-			.values({ phone, password })
-			.returning();
+    const existing = await db.select().from(tableUsers).where(eq(tableUsers.phone, phone));
 
-		const newUser = result[0];
+    console.log(env.REFRESH_TOKEN_EXPIRATION);
 
-		const tokens = AuthService.generateTokens(newUser.userId, newUser.phone);
+    if (existing.length)
+      throw new TRPCError({
+        code: 'CONFLICT',
+        message: 'Пользователь с таким номером телефона уже существует',
+      });
 
-		const userWithTokens = await db
-			.update(tableUsers)
-			.set({ refreshToken: encrypt(tokens.refreshToken) })
-			.where(eq(tableUsers.userId, newUser.userId))
-			.returning();
+    const result = await db.insert(tableUsers).values({ phone, password }).returning();
+    const newUser = result[0];
 
-		return {
-			...userWithTokens[0],
-			accessToken: tokens.accessToken,
-		};
-	}
+    const tokens = AuthService.generateTokens(newUser.userId, newUser.phone);
 
-	static async login({ phone, password }: { phone: string; password: string }) {
-		const query = await db
-			.select()
-			.from(tableUsers)
-			.where(eq(tableUsers.phone, phone));
+    const userWithTokens = await db
+      .update(tableUsers)
+      .set({ refreshToken: encrypt(tokens.refreshToken) })
+      .where(eq(tableUsers.userId, newUser.userId))
+      .returning();
 
-		if (!query.length)
-			throw new TRPCError({
-				code: 'NOT_FOUND',
-				message: 'Нет аккаунта с таким номером телефона',
-			});
+    return {
+      ...userWithTokens[0],
+      accessToken: tokens.accessToken,
+    };
+  }
 
-		const user = query[0];
+  static async login({ phone, password }: { phone: string; password: string }) {
+    if (isPreview) {
+      // В preview делаем “мягкий логин”: если юзера нет — создаём.
+      // Это удобно для витрины и не ломает перенос на сервер.
+      const user = upsertUserPreview(phone, password);
 
-		const checkPassword = await comparePassword(password, user.password);
-		if (!checkPassword)
-			throw new TRPCError({
-				code: 'UNAUTHORIZED',
-				message: 'Номер телефона или пароль введены неправильно',
-			});
+      // Если хочешь строгий режим — раскомментируй:
+      // if (user.password !== password) throw new TRPCError({ code: 'UNAUTHORIZED', message: 'Неверный пароль (preview)' });
 
-		const tokens = AuthService.generateTokens(user.userId, phone);
+      const tokens = AuthService.generateTokens(user.userId, user.phone);
+      const updated = await AuthService.updateTokens(user.userId, tokens.refreshToken);
 
-		return {
-			...user,
-			accessToken: tokens.accessToken,
-			refreshToken: (
-				await AuthService.updateTokens(user.userId, tokens.refreshToken)
-			).refreshToken,
-		};
-	}
+      return {
+        ...updated,
+        accessToken: tokens.accessToken,
+        refreshToken: updated.refreshToken,
+      };
+    }
+
+    const query = await db.select().from(tableUsers).where(eq(tableUsers.phone, phone));
+
+    if (!query.length)
+      throw new TRPCError({
+        code: 'NOT_FOUND',
+        message: 'Нет аккаунта с таким номером телефона',
+      });
+
+    const user = query[0];
+
+    const checkPassword = await comparePassword(password, user.password);
+    if (!checkPassword)
+      throw new TRPCError({
+        code: 'UNAUTHORIZED',
+        message: 'Номер телефона или пароль введены неправильно',
+      });
+
+    const tokens = AuthService.generateTokens(user.userId, phone);
+
+    return {
+      ...user,
+      accessToken: tokens.accessToken,
+      refreshToken: (await AuthService.updateTokens(user.userId, tokens.refreshToken)).refreshToken,
+    };
+  }
 }
